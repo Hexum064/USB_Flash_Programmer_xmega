@@ -1,33 +1,10 @@
 /*
  * DIYReflowOvenV1.c
  *
- * Created: 2016-12-13 22:13:06
+ * Created: 2019-07-02
  * Author : Branden
  */ 
-/**
- * \mainpage User Application template doxygen documentation
- *
- * \par Empty user application template
- *
- * Bare minimum empty user application template
- *
- * \par Content
- *
- * -# Include the ASF header files (through asf.h)
- * -# "Insert system clock initialization code here" comment
- * -# Minimal main function that starts with a call to board_init()
- * -# "Insert application code here" comment
- *
- */
 
-/*
- * Include header files for all drivers that have been imported from
- * Atmel Software Framework (ASF).
- */
-/*
- * Support and FAQ: visit <a href="http://www.atmel.com/design-support/">Atmel Support</a>
- */
-//#define __AVR_ATxmega128A4U__
 
 
 #define  F_CPU 32000000UL
@@ -49,6 +26,7 @@
 #define MEM_FAST_READ 0x0B
 #define MEM_SECT_ERASE 0x20
 #define MEM_CHIP_ERASE 0xC7
+#define MEM_128K_ERASE 0xD2
 #define MEM_READ_ID 0x9F
 
 #define MEM_STAT_WEN 0x02
@@ -62,6 +40,7 @@
 #define RX_READ_DATA 0x21
 
 #define MEM_BLOCK_SIZE 256
+#define MEM_SECTOR_SIZE 4096
 
 void uart_putchar(uint8_t c, FILE * stream);
 FILE mystdout = FDEV_SETUP_STREAM(uart_putchar, NULL, _FDEV_SETUP_WRITE);
@@ -151,10 +130,28 @@ void memEnableWrite()
 	return;
 }
 
-void memEraseSector(uint32_t address)
+void memErase128kBlock(uint32_t address)
 {
 	waitForNotBusy();
 			
+	memEnableWrite();
+	
+	
+	
+	CS_DISABLE();
+	CS_ENABLE();
+	
+	sendSPI(MEM_128K_ERASE);
+	memSendAddress(address);
+	
+	CS_DISABLE();
+	return;	
+}
+
+void memEraseSector(uint32_t address)
+{
+	waitForNotBusy();
+	
 	memEnableWrite();
 	
 	
@@ -166,7 +163,7 @@ void memEraseSector(uint32_t address)
 	memSendAddress(address);
 	
 	CS_DISABLE();
-	return;	
+	return;
 }
 
 void memRead256ToStdOut(uint32_t address)
@@ -352,7 +349,7 @@ void writeUARTBuff(void* buff, uint16_t len)
 
 void returnChipId()
 {
-	printf("Reading Chip Id\r\n");
+	//printf("Reading Chip Id\r\n");
 	waitForNotBusy();
 	memEnableWrite();
 	CS_DISABLE();
@@ -369,7 +366,7 @@ void returnChipId()
 
 void eraseChip()
 {
-	printf("Erasing Chip\r\n");
+	//printf("Erasing Chip\r\n");
 	waitForNotBusy();
 	
 	CS_DISABLE();
@@ -397,7 +394,7 @@ void readText()
 	udi_cdc_putc(_rxData[0]);
 	udi_cdc_putc(_rxData[1]);
 	
-	printf("Reading 0x%02x 0x%02x %lu chars\r\n", _rxData[0], _rxData[1], _rxDataLen);
+	//printf("Reading 0x%02x 0x%02x %lu chars\r\n", _rxData[0], _rxData[1], _rxDataLen);
 	
 	while(1)
 	{
@@ -424,7 +421,47 @@ void readText()
 	
 }
 
-
+void readData()
+{
+	uint32_t len;
+	
+	
+	//The first 4 bytes are the total length of the Data including the lookup table 
+	memReadToBuffer(MEM_SECTOR_SIZE, _rxData, 4);
+	_rxDataLen = ((uint32_t)_rxData[0] << 24) + ((uint32_t)_rxData[1] << 16) + ((uint32_t)_rxData[2] << 8) + (uint32_t)_rxData[3];
+	_rxDataPos = 4;
+	
+	udi_cdc_putc(_rxData[0]);
+	udi_cdc_putc(_rxData[1]);
+	udi_cdc_putc(_rxData[2]);
+	udi_cdc_putc(_rxData[3]);
+	
+	//printf("Reading 0x%02x 0x%02x 0x%02x 0x%02x %lu chars\r\n", _rxData[0], _rxData[1], _rxData[2], _rxData[3], _rxDataLen);
+	
+	while(1)
+	{
+		if (_rxDataLen < MEM_BLOCK_SIZE) //Less than MEM_BLOCK_SIZE because that's the size of our buffer
+		{
+			if (_rxDataLen > 0)
+			{
+				
+				//printf("Reading ending %u bytes from 0x%08x\r\n",len, _rxDataPos);
+				memReadToBuffer(_rxDataPos + MEM_SECTOR_SIZE, _rxData, _rxDataLen);
+				udi_cdc_multi_write_buf(0, _rxData, _rxDataLen);
+			}
+			return;	
+		}
+		else
+		{		
+			//printf("Reading 256 bytes from 0x%08x\r\n", _rxDataPos);	
+			memReadToBuffer(_rxDataPos + MEM_SECTOR_SIZE, _rxData, 255);
+			_rxDataLen -= 256;
+			_rxDataPos+=256;
+			udi_cdc_multi_write_buf(0, _rxData, 256);			
+		}
+	}
+	
+}
 
 void uart_putchar(uint8_t c, FILE * stream)
 {
@@ -446,13 +483,163 @@ void my_callback_cdc_disable(void)
 
 }
 
+void writeText(uint8_t bytesRead, uint8_t *bytes)
+{
+	uint8_t bytesLeft = 0;
+	//printf("write data\r\n");
+			
+	//This is the way we detect the first read through. Even if the length being sent is 0, we will be stopping here anyways.
+	//NOTE: If this is unreliable, we should include a state flag that indicates this is the first time through.
+	if (bytesRead > 1 && _rxDataLen == 0)
+	{
+		_currentCommand = RX_WRITE_TEXT;	//Set the current command
+		memEraseSector(0x00);	//The string is written to the very first sector.
+		waitForNotBusy();
+		_rxDataLen = ((uint32_t)bytes[0] << 8) + (uint32_t)bytes[1]; //Get the length of the text, first time through,  byte 0 and 1 should be the 16bit length
+				
+				
+		//printf("Len: %lu  \r\n", _rxDataLen);
+
+
+				
+	}
+
+	//Here we have to split the array of data read between the current memory block and the next one.
+	if ((bytesRead + _rxIndex) >= MEM_BLOCK_SIZE)
+	{
+		//_rxData + _rxIndex is pointer math
+		//This should fill our _rxData buffer (which is the same size as a block) so we should write the block now and update the _rxDataPos
+		bytesLeft = MEM_BLOCK_SIZE - _rxIndex;
+		memcpy(_rxData + _rxIndex, bytes, bytesLeft);
+		_rxIndex += bytesRead; //_rxIndex is 8bit. if _rxIndex = 192, then _rxIndex + 64 would roll over to 0
+				
+		//printf("Writing 256 bytes to 0x%08lx\r\n", (_rxDataPos & 0xFFFFFF00));
+		memWriteBuff((_rxDataPos & 0xFFFFFF00), _rxData, MEM_BLOCK_SIZE - 1);
+				
+				
+		//Because _rxIndex would have rolled over to 0 if we were on a factor of 256, and we are already here because the current amount of bytes read + the current index is greater or equal to our Block size
+		if (_rxIndex != 0)
+		{
+			//We are copying what is left in bytes and bytes + bytesLeft is pointer math
+			memcpy(_rxData, bytes + bytesLeft, bytesRead - bytesLeft);
+		}
+				
+	}
+	else
+	{
+		memcpy(_rxData + _rxIndex, bytes, bytesRead);
+		_rxIndex += bytesRead;
+	}
+			
+	_rxDataPos += bytesRead;
+	//printf("Pos %lu\r\n", _rxDataPos);
+			
+	//We have the whole message so just write it and be done with the command. Subtract 2 because the len are at the beginning
+	if ((_rxDataPos - 2) == _rxDataLen)
+	{
+		//Write the last bit of data
+		memWriteBuff((_rxDataPos & 0xFFFFFF00), _rxData, _rxIndex);
+		//printf("Writing %u bytes from index %u to 0x%08lx\r\n",_rxIndex, (_rxDataPos & 0xFFFFFF00));
+		//Send ack byte;
+		udi_cdc_putc(0xFF);
+		//printf("Done writing %lu bytes\r\n", _rxDataPos);
+		_currentCommand = 0;
+		_rxDataPos = 0;
+
+		//return;
+	}
+	
+	
+}
+
+void writeData(uint8_t bytesRead, uint8_t *bytes)
+{
+	uint8_t bytesLeft = 0;
+		
+	if (bytesRead > 3 && _rxDataLen == 0)
+	{
+		_currentCommand = RX_WRITE_DATA;	//Set the current command
+				
+		waitForNotBusy();
+		_rxDataLen = ((uint32_t)bytes[0] << 24) + ((uint32_t)bytes[1] << 16) + ((uint32_t)bytes[2] << 8) + (uint32_t)bytes[3]; //Get the length of the text, first time through,  bytes 0 to 3 should be the 32bit length
+		_rxDataPos = 0;
+				
+		//printf("Len: %lu  0x%02x 0x%02x 0x%02x 0x%02x\r\n", _rxDataLen, bytes[0], bytes[1], bytes[2], bytes[3]);
+				
+		//Erase the number of sectors we will need to store the data
+		do
+		{
+			//_rxDataPos is being used for our address here to erase sectors
+			//We initialize our _rxDataPos this way to start our erase at the second sector.
+			_rxDataPos += MEM_SECTOR_SIZE;
+			//printf("Erasing 128K 0x%08lx\r\n", _rxDataPos);
+			memEraseSector(_rxDataPos);	//The string is written to the very first sector.
+			waitForNotBusy();
+					
+		} while (_rxDataPos < (_rxDataLen + 4)); // + 4 to include room for the length bytes
+				
+		//Reset _rxDataPos
+		_rxDataPos = 0;
+
+				
+	}
+
+	//Here we have to split the array of data read between the current memory block and the next one.
+	if ((bytesRead + _rxIndex) >= MEM_BLOCK_SIZE)
+	{
+		//_rxData + _rxIndex is pointer math
+		//This should fill our _rxData buffer (which is the same size as a block) so we should write the block now and update the _rxDataPos
+		bytesLeft = MEM_BLOCK_SIZE - _rxIndex;
+		memcpy(_rxData + _rxIndex, bytes, bytesLeft);
+		_rxIndex += bytesRead; //_rxIndex is 8bit. if _rxIndex = 192, then _rxIndex + 64 would roll over to 0
+				
+		//printf("Writing 256 bytes to 0x%08lx\r\n", (_rxDataPos & 0xFFFFFF00) + MEM_SECTOR_SIZE);
+		//We add  MEM_SECTOR_SIZE to our address to offset everything to the second sector
+		memWriteBuff((_rxDataPos & 0xFFFFFF00) + MEM_SECTOR_SIZE, _rxData, MEM_BLOCK_SIZE - 1);
+				
+				
+		//Because _rxIndex would have rolled over to 0 if we were on a factor of 256, and we are already here because the current amount of bytes read + the current index is greater or equal to our Block size
+		if (_rxIndex != 0)
+		{
+			//We are copying what is left in bytes and bytes + bytesLeft is pointer math
+			memcpy(_rxData, bytes + bytesLeft, bytesRead - bytesLeft);
+		}
+				
+	}
+	else
+	{
+		memcpy(_rxData + _rxIndex, bytes, bytesRead);
+		_rxIndex += bytesRead;
+	}
+			
+	_rxDataPos += bytesRead;
+	//printf("Pos %lu\r\n", _rxDataPos);
+			
+	//We have the whole message so just write it and be done with the command. Subtract 4 because the len are at the beginning
+	if ((_rxDataPos - 4) == _rxDataLen)
+	{
+		//Write the last bit of data
+		//We add  MEM_SECTOR_SIZE to our address to offset everything to the second sector
+		memWriteBuff((_rxDataPos & 0xFFFFFF00) + MEM_SECTOR_SIZE, _rxData, _rxIndex);
+		//printf("Writing %u bytes from index %u to 0x%08x\r\n",_rxIndex, (_rxDataPos & 0xFFFFFF00));
+		//Send ack byte;
+		udi_cdc_putc(0xFF);
+		//printf("Done writing %lu bytes\r\n", _rxDataPos);
+		_currentCommand = 0;
+		_rxDataPos = 0;
+
+		//return;
+	}
+				
+}
+
 void my_callback_rx_notify(uint8_t port)
 {
 	
 	//printf("RX\r\n");
 	
 	//return;
-	uint16_t bytesRead = 0;
+	uint8_t bytesRead = 0;
 	uint8_t bytes[UDI_CDC_COMM_EP_SIZE]; //UDI_CDC_COMM_EP_SIZE is the max size of the number of bytes that will be received at once.
 	uint8_t bytesLeft = 0;
 	
@@ -463,15 +650,12 @@ void my_callback_rx_notify(uint8_t port)
 		_rxDataLen = 0;
 		_rxDataPos = 0;	
 		_rxIndex = 0;
-		printf("Cmd: 0x%02x\r\n", _currentCommand);
+		//printf("Cmd: 0x%02x\r\n", _currentCommand);
 	}
 	
 	bytesRead = udi_cdc_read_no_polling(bytes, UDI_CDC_COMM_EP_SIZE);
 	//printf("RX Received %u bytes\r\n", bytesRead);
-		
 
-
-		
 	switch(_currentCommand)
 	{
 		//These are long running and implemented in the main loop instead of here in the IRQ handler
@@ -483,79 +667,12 @@ void my_callback_rx_notify(uint8_t port)
 		//case RX_ERASE_ALL:
 
 		case RX_WRITE_TEXT:
-			//printf("write data\r\n");
-			
-			//This is the way we detect the first read through. Even if the lenght being sent is 0, we will be stopping here anyways.
-			//NOTE: If this is unrelyable, we should include a state flag that indicates this is the first time through.
-			if (bytesRead > 2 && _rxDataLen == 0)
-			{
-				_currentCommand = RX_WRITE_TEXT;	//Set the current command
-				memEraseSector(0x00);	//The string is written to the very first sector.
-				waitForNotBusy();
-				_rxDataLen = (uint32_t)(bytes[0] << 8) + (uint32_t)bytes[1]; //Get the length of the text, first time through,  byte 0 and 1 should be the 16bit length
-			
-				
-				printf("Len: %lu\r\n", _rxDataLen);
-
-
-					
-			}
-
-			//Here we have to split the array of data read between the current memory block and the next one.
-			if ((bytesRead + _rxIndex) >= MEM_BLOCK_SIZE)
-			{
-				//_rxData + _rxIndex is pointer math
-				//This should fill our _rxData buffer (which is the same size as a block) so we should write the block now and update the _rxDataPos
-				bytesLeft = MEM_BLOCK_SIZE - _rxIndex;
-				memcpy(_rxData + _rxIndex, bytes, bytesLeft);
-				_rxIndex += bytesRead; //_rxIndex is 8bit. if _rxIndex = 192, then _rxIndex + 64 would roll over to 0
-				
-				//printf("Writing 256 bytes to 0x%08x\r\n", (_rxDataPos & 0xFFFFFF00));
-				memWriteBuff((_rxDataPos & 0xFFFFFF00), _rxData, MEM_BLOCK_SIZE - 1);
-	
-				
-				//Because _rxIndex would have rolled over to 0 if we were on a factor of 256, and we are already here because the current ammount of bytes read + the current index is greater or equal to our Block size
-				if (_rxIndex != 0)
-				{
-					//We are copying what is left in bytes and bytes + bytesLeft is pointer math
-					memcpy(_rxData, bytes + bytesLeft, bytesRead - bytesLeft);
-				}
-				
-			}
-			else
-			{
-				memcpy(_rxData + _rxIndex, bytes, bytesRead);
-				_rxIndex += bytesRead; 
-			}
-			
-			_rxDataPos += bytesRead;
-			printf("Pos %lu\r\n", _rxDataPos);
-			
-			//We have the whole message so just write it and be done with the command. Subtract 2 because the len are at the beginning
-			if ((_rxDataPos - 2) == _rxDataLen)
-			{
-				//Write the last bit of data
-				memWriteBuff((_rxDataPos & 0xFFFFFF00), _rxData, _rxIndex);
-				//printf("Writing %u bytes from index %u to 0x%08x\r\n",_rxIndex, (_rxDataPos & 0xFFFFFF00));
-				//Send ack byte;
-				udi_cdc_putc(0xFF);
-				//printf("Done writing %lu bytes\r\n", _rxDataPos);
-				_currentCommand = 0;	
-				_rxDataPos = 0;
-
-				//return;			
-			}
-							
-			
-		
+			writeText(bytesRead, bytes);
 			break;
 		case RX_WRITE_DATA:
+			writeData(bytesRead, bytes);
 			break;
-		
 	}
-
-	
-	
 
 }
 
@@ -586,7 +703,7 @@ int main(void)
 	sei();
 
 
-	printf("Started\r\n");
+	//printf("Started\r\n");
 
 
 	while(1)
@@ -600,7 +717,7 @@ int main(void)
 		switch(_currentCommand)
 		{
 			case 'a':
-				memRead256ToStdOut(0x00000000);
+				memRead256ToStdOut(0x00001000);
 				_currentCommand = 0;
 				break;
 			case RX_READ_ID:
@@ -612,11 +729,13 @@ int main(void)
 			case RX_READ_TEXT:
 			case 'c':			
 				readText();
-				printf("\r\nDone Reading\r\n");
+				//printf("\r\nDone Reading Text\r\n");
 				_currentCommand = 0;
 				break;
 			case RX_READ_DATA:
 			case 'd':			
+				readData();
+				//printf("\r\nDone Reading Data\r\n");
 				_currentCommand = 0;
 				break;		
 			case RX_ERASE_ALL:
